@@ -799,7 +799,7 @@ void run_gmp_differential_sub_test(std::size_t iterations) {
             //  失敗時専用の緩い検証関数 `bool is_physically_safe() const` を本体側に1つ用意するのがスマート)
             
             /* もしメンバに直接アクセスできる、あるいは軽量 getter がある場合のコード */
-            if (pfi_a.active_words_ > TEST_MAX_WORDS * 3) {
+            if (pfi_a.active_words() > TEST_MAX_WORDS * 3) {
                 std::cerr << "CRITICAL FAILURE: sub_abs_inplace failed, and active_words_ blew up dangerously!" << std::endl;
                 std::exit(1);
             }
@@ -839,6 +839,1133 @@ void run_gmp_differential_sub_test(std::size_t iterations) {
 
 // --- 2026年6月9日16時39分 ---
 
+void run_gmp_differential_sub_from_test(std::size_t iterations) {
+    std::cout << "Running: GMP Differential sub_abs_from_inplace Test (" << iterations << " iterations)..." << std::endl;
+
+    std::random_device rd;
+    uint64_t seed = rd();
+    std::mt19937_64 eng(seed);
+    std::cout << "   [GMP Sub From Fuzz Seed]: 0x" << std::hex << seed << std::dec << std::endl;
+
+    gmp_randstate_t gmp_state;
+    gmp_randinit_default(gmp_state);
+    gmp_randseed_ui(gmp_state, seed);
+
+    const std::size_t TEST_MAX_WORDS = 300;
+    const unsigned long BITS_PER_WORD = static_cast<unsigned long>(PFI2::DIGITS_PER_WORD * std::log2(PFI2::BASE) * 0.8);
+    const unsigned long MAX_SAFE_BITS = TEST_MAX_WORDS * BITS_PER_WORD;
+
+    mpz_t gmp_a, gmp_b, gmp_res, pfi_gmp_res;
+    mpz_init(gmp_a);
+    mpz_init(gmp_b);
+    mpz_init(gmp_res);
+    mpz_init(pfi_gmp_res);
+
+    mpz_t base_pow_start, base_pow_end, lower_part, upper_part, low_noise;
+    mpz_init(base_pow_start);
+    mpz_init(base_pow_end);
+    mpz_init(lower_part);
+    mpz_init(upper_part);
+    mpz_init(low_noise);
+
+    // 独立した6つの生成戦略を均等にサンプリングする
+    std::uniform_int_distribution<int> strategy_dist(0, 5);
+    std::uniform_int_distribution<unsigned long> bit_dist(1, MAX_SAFE_BITS);
+
+    for (std::size_t i = 0; i < iterations; ++i) {
+        // 固定容量、コピー禁止寄りの設計。キャパシティは十分に確保
+        PFI2 pfi_a(TEST_MAX_WORDS * 3); 
+        PFI2 pfi_b(TEST_MAX_WORDS * 3);
+
+        unsigned long bits_a = bit_dist(eng);
+        unsigned long bits_b = bit_dist(eng);
+
+        int strategy = strategy_dist(eng);
+
+        switch (strategy) {
+            case 0: // 【戦略0】完全ランダムペア (A <= B が約50%で発生)
+                mpz_urandomb(gmp_a, gmp_state, bits_a);
+                mpz_urandomb(gmp_b, gmp_state, bits_b);
+                break;
+
+            case 1: // 【戦略1】ビット長を完全一致させ、データレベルの大小関係を競わせる (active_words_ 一致)
+                bits_b = bits_a;
+                mpz_urandomb(gmp_a, gmp_state, bits_a);
+                mpz_urandomb(gmp_b, gmp_state, bits_b);
+                break;
+
+            case 2: // 【戦略2】A と B を同一値にした上で、微小ノイズで大小を狂わせる (極限のニアピンケース)
+                mpz_urandomb(gmp_a, gmp_state, bits_a);
+                mpz_set(gmp_b, gmp_a);
+                mpz_set_ui(low_noise, eng() % 100000);
+                if (eng() % 2 == 0) {
+                    mpz_add(gmp_b, gmp_b, low_noise); // B の方がわずかに大きい (成功パターン)
+                } else {
+                    mpz_sub(gmp_b, gmp_b, low_noise); // A の方がわずかに大きい (失敗パターン)
+                }
+                break;
+
+            case 3: // 【戦略3】A が完全なる 0 の境界条件ケース (確実に成功し B がそのままコピーされる)
+                mpz_set_ui(gmp_a, 0);
+                mpz_urandomb(gmp_b, gmp_state, bits_b);
+                break;
+
+            case 4: // 【戦略4】A == B (結果が完全な 0 に潰れるゼロ・コラプス最大ケース)
+                mpz_urandomb(gmp_a, gmp_state, bits_a);
+                mpz_set(gmp_b, gmp_a);
+                break;
+
+            case 5: // 【戦略5】B >= A を維持しつつ、B の内部に「0 の山」を仕込んで SKIP_SIGNAL ドミノを殺しにいく
+                if (bits_a > bits_b) std::swap(bits_a, bits_b);
+                mpz_urandomb(gmp_a, gmp_state, bits_a);
+                mpz_urandomb(gmp_b, gmp_state, bits_b);
+                if (mpz_cmp(gmp_b, gmp_a) < 0) mpz_swap(gmp_a, gmp_b);
+                
+                // B の中間に 0 の連続を埋め込むハック
+                {
+                    std::size_t approx_max_digits = (bits_b / 19) + 1;
+                    std::size_t idx_start = (approx_max_digits > 0) ? (eng() % approx_max_digits) : 0;
+                    std::size_t len = 5;
+                    mpz_ui_pow_ui(base_pow_start, PFI2::BASE, idx_start);
+                    mpz_ui_pow_ui(base_pow_end, PFI2::BASE, idx_start + len);
+                    mpz_fdiv_r(lower_part, gmp_b, base_pow_start);
+                    mpz_fdiv_q(upper_part, gmp_b, base_pow_end);
+                    mpz_mul(gmp_b, upper_part, base_pow_end);
+                    mpz_add(gmp_b, gmp_b, lower_part);
+                }
+                // 再び安全弁
+                if (mpz_cmp(gmp_b, gmp_a) < 0) mpz_swap(gmp_a, gmp_b);
+                break;
+        }
+
+        // 絶対値カーネルのテストのため符号は確実に正に倒す
+        mpz_abs(gmp_a, gmp_a);
+        mpz_abs(gmp_b, gmp_b);
+
+        // PFI2 にデータを充填
+        [[maybe_unused]] bool ok_a = pfi_a.from_mpz(gmp_a);
+        [[maybe_unused]] bool ok_b = pfi_b.from_mpz(gmp_b);
+        assert(ok_a && ok_b);
+
+        // 数学的な正解予測（オラクル）： sub_abs_from_inplace は |rhs| >= |this|、つまり B >= A で成功する
+        bool expect_success = (mpz_cmp(gmp_b, gmp_a) >= 0);
+
+        // カーネル実行： pfi_a <- |pfi_b| - |pfi_a|
+        bool ok_sub = pfi_a.sub_abs_from_inplace(pfi_b);
+
+        // 1. 戻り値の真偽値チェック
+        if (ok_sub != expect_success) {
+            std::cerr << "CRITICAL FAILURE: sub_abs_from_inplace returned " << (ok_sub ? "true" : "false")
+                      << ", but expected " << (expect_success ? "true" : "false") << " at iteration " << i << std::endl;
+            gmp_printf("   gmp_a (this) = %Zd\n", gmp_a);
+            gmp_printf("   gmp_b (rhs)  = %Zd\n", gmp_b);
+            std::exit(1);
+        }
+
+        if (!ok_sub) {
+            // ----------------------------------------------------------------
+            // 2. 失敗（false）した時の検証
+            // ----------------------------------------------------------------
+            // 戻り値が false である以上、数学的に「確実に B < A であったこと」を検証
+            if (mpz_cmp(gmp_b, gmp_a) >= 0) {
+                std::cerr << "CRITICAL FAILURE: sub_abs_from_inplace returned false, but mathematically B >= A at iteration " << i << std::endl;
+                gmp_printf("   gmp_a = %Zd\n", gmp_a);
+                gmp_printf("   gmp_b = %Zd\n", gmp_b);
+                std::exit(1);
+            }
+
+            // 【引数 rhs (pfi_b) の不変性チェック】
+            // 演算成否に関わらず、引数 rhs のバッファが破壊されてはならない
+            pfi_b.to_mpz(pfi_gmp_res);
+            if (mpz_cmp(gmp_b, pfi_gmp_res) != 0) {
+                std::cerr << "CRITICAL FAILURE: sub_abs_from_inplace failed, but MUTATED the argument rhs (pfi_b) at iteration " << i << std::endl;
+                gmp_printf("   Original B = %Zd\n", gmp_b);
+                gmp_printf("   Mutated B  = %Zd\n", pfi_gmp_res);
+                std::exit(1);
+            }
+
+            // 【this の物理安全弁チェック】
+            // 仕様上「this の内容は保持されない」が、メモリ空間を突き破る破綻が起きていないかチェック
+            // getter 経由、もしくはメンバアクセス可能という前提
+            if (pfi_a.active_words() > TEST_MAX_WORDS * 3) {
+                std::cerr << "CRITICAL FAILURE: sub_abs_from_inplace failed, and active_words_ blew up dangerously!" << std::endl;
+                std::exit(1);
+            }
+
+            continue; 
+        } else {
+            // ---------------------------------------------------------
+            // 3. 成功（true）した時、結果が完全一致することを確認
+            // ---------------------------------------------------------
+            // 結果は B - A
+            mpz_sub(gmp_res, gmp_b, gmp_a);
+            pfi_a.to_mpz(pfi_gmp_res);
+
+            if (mpz_cmp(gmp_res, pfi_gmp_res) != 0) {
+                std::cerr << "CRITICAL FAILURE: Mismatch in sub_abs_from_inplace result at iteration " << i << std::endl;
+                gmp_printf("   gmp_a (this) = %Zd\n", gmp_a);
+                gmp_printf("   gmp_b (rhs)  = %Zd\n", gmp_b);
+                gmp_printf("   Expected     = %Zd\n", gmp_res);
+                gmp_printf("   Actual       = %Zd\n", pfi_gmp_res);
+                std::exit(1);
+            }
+        }
+
+        // 成功時のみ不変条件の厳密アサートをチェック（符号は維持、active_words_ のトリムが正常か）
+        if (!pfi_a.invariant_holds()) {
+            std::cerr << "CRITICAL FAILURE: Invariant broken after sub_abs_from_inplace at iteration " << i << std::endl;
+            std::exit(1);
+        }
+    }
+
+    mpz_clear(low_noise); mpz_clear(base_pow_start); mpz_clear(base_pow_end);
+    mpz_clear(lower_part); mpz_clear(upper_part);
+    mpz_clear(gmp_a); mpz_clear(gmp_b); mpz_clear(gmp_res); mpz_clear(pfi_gmp_res);
+    gmp_randclear(gmp_state);
+
+    std::cout << "-> Passed GMP Differential sub_abs_from_inplace Test successfully!" << std::endl;
+}
+
+// --- 2026年6月28日15時10分 ---
+
+void run_self_alias_test(std::size_t iterations) {
+    std::cout
+        << "Running: Self Alias Test ("
+        << iterations
+        << " iterations)..."
+        << std::endl;
+
+    std::random_device rd;
+    uint64_t seed = rd();
+    std::mt19937_64 eng(seed);
+
+    std::cout
+        << "   [Alias Seed]: 0x"
+        << std::hex << seed
+        << std::dec
+        << std::endl;
+
+    gmp_randstate_t gmp_state;
+    gmp_randinit_default(gmp_state);
+    gmp_randseed_ui(gmp_state, seed);
+
+    constexpr std::size_t TEST_WORDS = 300;
+
+    mpz_t gmp_original;
+    mpz_t gmp_expected;
+    mpz_t gmp_actual;
+
+    mpz_init(gmp_original);
+    mpz_init(gmp_expected);
+    mpz_init(gmp_actual);
+
+    const unsigned long MAX_BITS =
+        static_cast<unsigned long>(
+            TEST_WORDS *
+            PFI2::DIGITS_PER_WORD *
+            std::log2(PFI2::BASE) * 0.8
+        );
+
+    std::uniform_int_distribution<unsigned long>
+        bit_dist(0, MAX_BITS);
+
+    for (std::size_t i = 0; i < iterations; ++i) {
+
+        unsigned long bits = bit_dist(eng);
+
+        mpz_urandomb(gmp_original, gmp_state, bits);
+
+        //------------------------------------------------------------------
+        // add_abs_inplace(self)
+        //------------------------------------------------------------------
+        {
+            PFI2 a(TEST_WORDS * 3);
+
+            bool ok = a.from_mpz(gmp_original);
+            assert(ok);
+
+            mpz_mul_ui(gmp_expected, gmp_original, 2);
+
+            bool r = a.add_abs_inplace(a);
+
+            if (!r) {
+                std::cerr
+                    << "add_abs_inplace(self) returned false at "
+                    << i << std::endl;
+                std::exit(1);
+            }
+
+            a.to_mpz(gmp_actual);
+
+            if (mpz_cmp(gmp_expected, gmp_actual) != 0) {
+                std::cerr
+                    << "FAIL add_abs_inplace(self) at "
+                    << i << std::endl;
+
+                gmp_printf("orig     = %Zd\n", gmp_original);
+                gmp_printf("expected = %Zd\n", gmp_expected);
+                gmp_printf("actual   = %Zd\n", gmp_actual);
+
+                std::exit(1);
+            }
+
+            assert(a.invariant_holds());
+        }
+
+        //------------------------------------------------------------------
+        // sub_abs_inplace(self)
+        //------------------------------------------------------------------
+        {
+            PFI2 a(TEST_WORDS * 3);
+
+            bool ok = a.from_mpz(gmp_original);
+            assert(ok);
+
+            mpz_set_ui(gmp_expected, 0);
+
+            bool r = a.sub_abs_inplace(a);
+
+            if (!r) {
+                std::cerr
+                    << "sub_abs_inplace(self) returned false at "
+                    << i << std::endl;
+                std::exit(1);
+            }
+
+            a.to_mpz(gmp_actual);
+
+            if (mpz_cmp(gmp_expected, gmp_actual) != 0) {
+                std::cerr
+                    << "FAIL sub_abs_inplace(self) at "
+                    << i << std::endl;
+
+                gmp_printf("orig     = %Zd\n", gmp_original);
+                gmp_printf("expected = %Zd\n", gmp_expected);
+                gmp_printf("actual   = %Zd\n", gmp_actual);
+
+                std::exit(1);
+            }
+
+            assert(a.invariant_holds());
+        }
+
+        //------------------------------------------------------------------
+        // sub_abs_from_inplace(self)
+        //------------------------------------------------------------------
+        {
+            PFI2 a(TEST_WORDS * 3);
+
+            bool ok = a.from_mpz(gmp_original);
+            assert(ok);
+
+            mpz_set_ui(gmp_expected, 0);
+
+            bool r = a.sub_abs_from_inplace(a);
+
+            if (!r) {
+                std::cerr
+                    << "sub_abs_from_inplace(self) returned false at "
+                    << i << std::endl;
+                std::exit(1);
+            }
+
+            a.to_mpz(gmp_actual);
+
+            if (mpz_cmp(gmp_expected, gmp_actual) != 0) {
+                std::cerr
+                    << "FAIL sub_abs_from_inplace(self) at "
+                    << i << std::endl;
+
+                gmp_printf("orig     = %Zd\n", gmp_original);
+                gmp_printf("expected = %Zd\n", gmp_expected);
+                gmp_printf("actual   = %Zd\n", gmp_actual);
+
+                std::exit(1);
+            }
+
+            assert(a.invariant_holds());
+        }
+
+        //------------------------------------------------------------------
+        // add_inplace(self)
+        //------------------------------------------------------------------
+        {
+            PFI2 a(TEST_WORDS * 3);
+
+            bool ok = a.from_mpz(gmp_original);
+            assert(ok);
+
+            mpz_mul_ui(gmp_expected, gmp_original, 2);
+
+            bool r = a.add_inplace(a);
+
+            if (!r) {
+                std::cerr
+                    << "add_inplace(self) returned false at "
+                    << i << std::endl;
+                std::exit(1);
+            }
+
+            a.to_mpz(gmp_actual);
+
+            if (mpz_cmp(gmp_expected, gmp_actual) != 0) {
+                std::cerr
+                    << "FAIL add_inplace(self) at "
+                    << i << std::endl;
+
+                gmp_printf("orig     = %Zd\n", gmp_original);
+                gmp_printf("expected = %Zd\n", gmp_expected);
+                gmp_printf("actual   = %Zd\n", gmp_actual);
+
+                std::exit(1);
+            }
+
+            assert(a.invariant_holds());
+        }
+
+        //------------------------------------------------------------------
+        // sub_inplace(self)
+        //------------------------------------------------------------------
+        {
+            PFI2 a(TEST_WORDS * 3);
+
+            bool ok = a.from_mpz(gmp_original);
+            assert(ok);
+
+            mpz_set_ui(gmp_expected, 0);
+
+            bool r = a.sub_inplace(a);
+
+            if (!r) {
+                std::cerr
+                    << "sub_inplace(self) returned false at "
+                    << i << std::endl;
+                std::exit(1);
+            }
+
+            a.to_mpz(gmp_actual);
+
+            if (mpz_cmp(gmp_expected, gmp_actual) != 0) {
+                std::cerr
+                    << "FAIL sub_inplace(self) at "
+                    << i << std::endl;
+
+                gmp_printf("orig     = %Zd\n", gmp_original);
+                gmp_printf("expected = %Zd\n", gmp_expected);
+                gmp_printf("actual   = %Zd\n", gmp_actual);
+
+                std::exit(1);
+            }
+
+            assert(a.invariant_holds());
+        }
+    }
+
+    mpz_clear(gmp_original);
+    mpz_clear(gmp_expected);
+    mpz_clear(gmp_actual);
+
+    gmp_randclear(gmp_state);
+
+    std::cout
+        << "-> Passed Self Alias Test successfully!"
+        << std::endl;
+}
+
+// --- 2026年6月28日15時15分 ---
+
+void run_gmp_differential_add_inplace_test(std::size_t iterations) {
+    std::cout << "Running: GMP Differential add_inplace Test (" << iterations << " iterations)..." << std::endl;
+
+    std::random_device rd;
+    uint64_t seed = rd();
+    std::mt19937_64 eng(seed);
+    std::cout << "   [GMP Add Inplace Fuzz Seed]: 0x" << std::hex << seed << std::dec << std::endl;
+
+    gmp_randstate_t gmp_state;
+    gmp_randinit_default(gmp_state);
+    gmp_randseed_ui(gmp_state, seed);
+
+    const std::size_t TEST_MAX_WORDS = 300;
+    const unsigned long BITS_PER_WORD = static_cast<unsigned long>(PFI2::DIGITS_PER_WORD * std::log2(PFI2::BASE) * 0.8);
+    const unsigned long MAX_SAFE_BITS = TEST_MAX_WORDS * BITS_PER_WORD;
+
+    mpz_t gmp_a, gmp_b, gmp_res, pfi_gmp_res;
+    mpz_init(gmp_a);
+    mpz_init(gmp_b);
+    mpz_init(gmp_res);
+    mpz_init(pfi_gmp_res);
+
+    // 符号反転やニアピンを制御するための分布
+    std::uniform_int_distribution<int> strategy_dist(0, 5);
+    std::uniform_int_distribution<unsigned long> bit_dist(1, MAX_SAFE_BITS);
+    std::uniform_int_distribution<int> sign_dist(0, 3); // 符号の組み合わせ (++, +-, -+, --)
+
+    for (std::size_t i = 0; i < iterations; ++i) {
+        // キャパシティは十分に確保 (固定容量・コピー禁止制約下での検証)
+        PFI2 pfi_a(TEST_MAX_WORDS * 3); 
+        PFI2 pfi_b(TEST_MAX_WORDS * 3);
+
+        unsigned long bits_a = bit_dist(eng);
+        unsigned long bits_b = bit_dist(eng);
+
+        int strategy = strategy_dist(eng);
+
+        switch (strategy) {
+            case 0: // 【戦略0】完全ランダムペア
+                mpz_urandomb(gmp_a, gmp_state, bits_a);
+                mpz_urandomb(gmp_b, gmp_state, bits_b);
+                break;
+
+            case 1: // 【戦略1】絶対値の有効ワード数を一致させて微細境界を競わせる
+                bits_b = bits_a;
+                mpz_urandomb(gmp_a, gmp_state, bits_a);
+                mpz_urandomb(gmp_b, gmp_state, bits_b);
+                break;
+
+            case 2: // 【戦略2】絶対値をニアピンにし、異符号時に主客転倒とゼロ・コラプスを誘発
+                mpz_urandomb(gmp_a, gmp_state, bits_a);
+                mpz_set(gmp_b, gmp_a);
+                if (eng() % 2 == 0) {
+                    mpz_add_ui(gmp_b, gmp_b, eng() % 100); // |B| の方がわずかに大きい
+                } else {
+                    mpz_sub_ui(gmp_b, gmp_b, eng() % 100); // |A| の方がわずかに大きい
+                }
+                break;
+
+            case 3: // 【戦略3】A が完全なる 0 の境界条件
+                mpz_set_ui(gmp_a, 0);
+                mpz_urandomb(gmp_b, gmp_state, bits_b);
+                break;
+
+            case 4: // 【戦略4】B が完全なる 0 の境界条件
+                mpz_urandomb(gmp_a, gmp_state, bits_a);
+                mpz_set_ui(gmp_b, 0);
+                break;
+
+            case 5: // 【戦略5】絶対値を完全に一致させる (A == -B の時に完全相殺)
+                mpz_urandomb(gmp_a, gmp_state, bits_a);
+                mpz_set(gmp_b, gmp_a);
+                break;
+        }
+
+        // ---------------------------------------------------------
+        // 符号のインジェクション (++, +-, -+, --)
+        // ---------------------------------------------------------
+        int sign_pattern = sign_dist(eng);
+        if (sign_pattern == 1) {        // (+ , -)
+            mpz_neg(gmp_b, gmp_b);
+        } else if (sign_pattern == 2) { // (- , +)
+            mpz_neg(gmp_a, gmp_a);
+        } else if (sign_pattern == 3) { // (- , -)
+            mpz_neg(gmp_a, gmp_a);
+            mpz_neg(gmp_b, gmp_b);
+        }
+
+        // PFI2 にデータを充填 (符号も内部で正しくパースされる想定)
+        [[maybe_unused]] bool ok_a = pfi_a.from_mpz(gmp_a);
+        [[maybe_unused]] bool ok_b = pfi_b.from_mpz(gmp_b);
+        assert(ok_a && ok_b);
+
+        // 物理キャパシティに基づく成否予測 (十分確保しているが契約検証として配置)
+        // 本来は結果の active_words_ が収まるかだが、安全サイドとして rhs が収まるかで判定
+        bool expect_success = (pfi_a.capacity_words() >= pfi_b.active_words());
+
+        // オラクル演算 (GMP による符号付き加算)
+        mpz_add(gmp_res, gmp_a, gmp_b);
+
+        // ターゲット演算実行
+        bool ok_add = pfi_a.add_inplace(pfi_b);
+
+        // 1. 戻り値の契約チェック
+        if (ok_add != expect_success) {
+            std::cerr << "CRITICAL FAILURE: add_inplace returned " << (ok_add ? "true" : "false")
+                      << ", but expected " << (expect_success ? "true" : "false") << " at iteration " << i << std::endl;
+            gmp_printf("   gmp_a = %Zd\n", gmp_a);
+            gmp_printf("   gmp_b = %Zd\n", gmp_b);
+            std::exit(1);
+        }
+
+        if (!ok_add) {
+            // 失敗時（容量不足など）、引数が巻き添えで破壊されていないかチェック
+            pfi_b.to_mpz(pfi_gmp_res);
+            if (mpz_cmp(gmp_b, pfi_gmp_res) != 0) {
+                std::cerr << "CRITICAL FAILURE: add_inplace failed, but MUTATED rhs at iteration " << i << std::endl;
+                std::exit(1);
+            }
+            continue;
+        } else {
+            // 2. 成功時、結果の代数的数値が完全一致するか
+            pfi_a.to_mpz(pfi_gmp_res);
+
+            if (mpz_cmp(gmp_res, pfi_gmp_res) != 0) {
+                std::cerr << "CRITICAL FAILURE: Mismatch in add_inplace result at iteration " << i << std::endl;
+                gmp_printf("   gmp_a    = %Zd\n", gmp_a);
+                gmp_printf("   gmp_b    = %Zd\n", gmp_b);
+                gmp_printf("   Expected = %Zd\n", gmp_res);
+                gmp_printf("   Actual   = %Zd\n", pfi_gmp_res);
+                std::exit(1);
+            }
+        }
+
+        // 3. クラスの代数的・物理的不変条件が維持されているかチェック
+        // (例: 結果が 0 のとき、符号が必ず false (正) にコラプスしているか等)
+        if (!pfi_a.invariant_holds()) {
+            std::cerr << "CRITICAL FAILURE: Invariant broken after add_inplace at iteration " << i << std::endl;
+            gmp_printf("   gmp_a    = %Zd\n", gmp_a);
+            gmp_printf("   gmp_b    = %Zd\n", gmp_b);
+            gmp_printf("   Actual   = %Zd\n", pfi_gmp_res);
+            std::exit(1);
+        }
+    }
+
+    mpz_clear(gmp_a); mpz_clear(gmp_b); mpz_clear(gmp_res); mpz_clear(pfi_gmp_res);
+    gmp_randclear(gmp_state);
+
+    std::cout << "-> Passed GMP Differential add_inplace Test successfully!" << std::endl;
+}
+
+// --- 2026年6月28日15時19分 ---
+
+void run_gmp_differential_sub_inplace_test(std::size_t iterations) {
+    std::cout << "Running: GMP Differential sub_inplace Test (" << iterations << " iterations)..." << std::endl;
+
+    std::random_device rd;
+    uint64_t seed = rd();
+    std::mt19937_64 eng(seed);
+    std::cout << "   [GMP Sub Inplace Fuzz Seed]: 0x" << std::hex << seed << std::dec << std::endl;
+
+    gmp_randstate_t gmp_state;
+    gmp_randinit_default(gmp_state);
+    gmp_randseed_ui(gmp_state, seed);
+
+    const std::size_t TEST_MAX_WORDS = 300;
+    const unsigned long BITS_PER_WORD = static_cast<unsigned long>(PFI2::DIGITS_PER_WORD * std::log2(PFI2::BASE) * 0.8);
+    const unsigned long MAX_SAFE_BITS = TEST_MAX_WORDS * BITS_PER_WORD;
+
+    mpz_t gmp_a, gmp_b, gmp_res, pfi_gmp_res;
+    mpz_init(gmp_a);
+    mpz_init(gmp_b);
+    mpz_init(gmp_res);
+    mpz_init(pfi_gmp_res);
+
+    std::uniform_int_distribution<int> strategy_dist(0, 5);
+    std::uniform_int_distribution<unsigned long> bit_dist(1, MAX_SAFE_BITS);
+    std::uniform_int_distribution<int> sign_dist(0, 3); // (++, +-, -+, --)
+
+    for (std::size_t i = 0; i < iterations; ++i) {
+        PFI2 pfi_a(TEST_MAX_WORDS * 3); 
+        PFI2 pfi_b(TEST_MAX_WORDS * 3);
+
+        unsigned long bits_a = bit_dist(eng);
+        unsigned long bits_b = bit_dist(eng);
+
+        int strategy = strategy_dist(eng);
+
+        switch (strategy) {
+            case 0: // 【戦略0】完全ランダムペア
+                mpz_urandomb(gmp_a, gmp_state, bits_a);
+                mpz_urandomb(gmp_b, gmp_state, bits_b);
+                break;
+
+            case 1: // 【戦略1】絶対値の桁（ワード数）を一致させて境界を競わせる
+                bits_b = bits_a;
+                mpz_urandomb(gmp_a, gmp_state, bits_a);
+                mpz_urandomb(gmp_b, gmp_state, bits_b);
+                break;
+
+            case 2: // 【戦略2】絶対値をニアピンにし、同符号時の主客転倒（符号トグル）を最大誘発
+                mpz_urandomb(gmp_a, gmp_state, bits_a);
+                mpz_set(gmp_b, gmp_a);
+                if (eng() % 2 == 0) {
+                    mpz_add_ui(gmp_b, gmp_b, eng() % 100); // |B| の方がわずかに大きい
+                } else {
+                    mpz_sub_ui(gmp_b, gmp_b, eng() % 100); // |A| の方がわずかに大きい
+                }
+                break;
+
+            case 3: // 【戦略3】A が完全なる 0 の境界条件 (0 - B = -B となる符号反転ルート)
+                mpz_set_ui(gmp_a, 0);
+                mpz_urandomb(gmp_b, gmp_state, bits_b);
+                break;
+
+            case 4: // 【戦略4】B が完全なる 0 の境界条件 (A - 0 = A で無風通過ルート)
+                mpz_urandomb(gmp_a, gmp_state, bits_a);
+                mpz_set_ui(gmp_b, 0);
+                break;
+
+            case 5: // 【戦略5】絶対値を完全一致させる (同符号なら A == B で 0 コラプスが発生)
+                mpz_urandomb(gmp_a, gmp_state, bits_a);
+                mpz_set(gmp_b, gmp_a);
+                break;
+        }
+
+        // ---------------------------------------------------------
+        // 符号のインジェクション (++, +-, -+, --)
+        // ---------------------------------------------------------
+        int sign_pattern = sign_dist(eng);
+        if (sign_pattern == 1) {        // (+ , -) -> 実質絶対値加算
+            mpz_neg(gmp_b, gmp_b);
+        } else if (sign_pattern == 2) { // (- , +) -> 実質絶対値加算
+            mpz_neg(gmp_a, gmp_a);
+        } else if (sign_pattern == 3) { // (- , -) -> 実質絶対値減算
+            mpz_neg(gmp_a, gmp_a);
+            mpz_neg(gmp_b, gmp_b);
+        }
+
+        // PFI2 に充填
+        [[maybe_unused]] bool ok_a = pfi_a.from_mpz(gmp_a);
+        [[maybe_unused]] bool ok_b = pfi_b.from_mpz(gmp_b);
+        assert(ok_a && ok_b);
+
+        // 物理キャパシティに基づく成否予測
+        bool expect_success = (pfi_a.capacity_words() >= pfi_b.active_words());
+
+        // オラクル演算 (GMP による符号付き減算)
+        mpz_sub(gmp_res, gmp_a, gmp_b);
+
+        // ターゲット演算実行
+        bool ok_sub = pfi_a.sub_inplace(pfi_b);
+
+        // 1. 戻り値の契約チェック
+        if (ok_sub != expect_success) {
+            std::cerr << "CRITICAL FAILURE: sub_inplace returned " << (ok_sub ? "true" : "false")
+                      << ", but expected " << (expect_success ? "true" : "false") << " at iteration " << i << std::endl;
+            gmp_printf("   gmp_a = %Zd\n", gmp_a);
+            gmp_printf("   gmp_b = %Zd\n", gmp_b);
+            std::exit(1);
+        }
+
+        if (!ok_sub) {
+            // 失敗時、引数の不変性チェック
+            pfi_b.to_mpz(pfi_gmp_res);
+            if (mpz_cmp(gmp_b, pfi_gmp_res) != 0) {
+                std::cerr << "CRITICAL FAILURE: sub_inplace failed, but MUTATED rhs at iteration " << i << std::endl;
+                std::exit(1);
+            }
+            continue;
+        } else {
+            // 2. 成功時、数値の完全一致検証
+            pfi_a.to_mpz(pfi_gmp_res);
+
+            if (mpz_cmp(gmp_res, pfi_gmp_res) != 0) {
+                std::cerr << "CRITICAL FAILURE: Mismatch in sub_inplace result at iteration " << i << std::endl;
+                gmp_printf("   gmp_a    = %Zd\n", gmp_a);
+                gmp_printf("   gmp_b    = %Zd\n", gmp_b);
+                gmp_printf("   Expected = %Zd\n", gmp_res);
+                gmp_printf("   Actual   = %Zd\n", pfi_gmp_res);
+                std::exit(1);
+            }
+        }
+
+        // 3. 代数的・物理的不変条件の維持チェック
+        if (!pfi_a.invariant_holds()) {
+            std::cerr << "CRITICAL FAILURE: Invariant broken after sub_inplace at iteration " << i << std::endl;
+            gmp_printf("   gmp_a    = %Zd\n", gmp_a);
+            gmp_printf("   gmp_b    = %Zd\n", gmp_b);
+            gmp_printf("   Actual   = %Zd\n", pfi_gmp_res);
+            std::exit(1);
+        }
+    }
+
+    mpz_clear(gmp_a); mpz_clear(gmp_b); mpz_clear(gmp_res); mpz_clear(pfi_gmp_res);
+    gmp_randclear(gmp_state);
+
+    std::cout << "-> Passed GMP Differential sub_inplace Test successfully!" << std::endl;
+}
+
+// --- 2026年6月28日15時39分 ---
+
+void run_gmp_differential_equal_test(std::size_t iterations) {
+    std::cout << "Running: GMP Differential operator== Test (" << iterations << " iterations)..." << std::endl;
+
+    std::random_device rd;
+    uint64_t seed = rd();
+    std::mt19937_64 eng(seed);
+    std::cout << "   [GMP Equal Fuzz Seed]: 0x" << std::hex << seed << std::dec << std::endl;
+
+    gmp_randstate_t gmp_state;
+    gmp_randinit_default(gmp_state);
+    gmp_randseed_ui(gmp_state, seed);
+
+    const std::size_t TEST_MAX_WORDS = 300;
+    const unsigned long BITS_PER_WORD = static_cast<unsigned long>(PFI2::DIGITS_PER_WORD * std::log2(PFI2::BASE) * 0.8);
+    const unsigned long MAX_SAFE_BITS = TEST_MAX_WORDS * BITS_PER_WORD;
+
+    mpz_t gmp_a, gmp_b;
+    mpz_init(gmp_a);
+    mpz_init(gmp_b);
+
+    std::uniform_int_distribution<int> strategy_dist(0, 5);
+    std::uniform_int_distribution<unsigned long> bit_dist(1, MAX_SAFE_BITS);
+    std::uniform_int_distribution<int> sign_dist(0, 1);
+
+    for (std::size_t i = 0; i < iterations; ++i) {
+        PFI2 pfi_a(TEST_MAX_WORDS * 3);
+        PFI2 pfi_b(TEST_MAX_WORDS * 3);
+
+        unsigned long bits_a = bit_dist(eng);
+        unsigned long bits_b = bit_dist(eng);
+
+        int strategy = strategy_dist(eng);
+
+        switch (strategy) {
+            case 0: // 【戦略0】完全ランダムペア (ほぼ確実に false になるケース)
+                mpz_urandomb(gmp_a, gmp_state, bits_a);
+                mpz_urandomb(gmp_b, gmp_state, bits_b);
+                // ランダムに符号をインジェクション
+                if (sign_dist(eng)) mpz_neg(gmp_a, gmp_a);
+                if (sign_dist(eng)) mpz_neg(gmp_b, gmp_b);
+                break;
+
+            case 1: // 【戦略1】完全に同一のビット長・同一のデータ (真に等値で memcmp まで完走するケース)
+                mpz_urandomb(gmp_a, gmp_state, bits_a);
+                if (sign_dist(eng)) mpz_neg(gmp_a, gmp_a);
+                mpz_set(gmp_b, gmp_a);
+                break;
+
+            case 2: // 【戦略2】絶対値は完全に同一だが、符号だけを反転させる (符号不一致による早期脱出の検証)
+                mpz_urandomb(gmp_a, gmp_state, bits_a);
+                // A が 0 の場合は符号反転しても 0 のままなので、非ゼロを保証
+                if (mpz_sgn(gmp_a) == 0) mpz_set_ui(gmp_a, 123456789ULL);
+                
+                mpz_set(gmp_b, gmp_a);
+                mpz_neg(gmp_b, gmp_b); // B は A の符号反転
+                break;
+
+            case 3: // 【戦略3】両方とも完全なる 0 (ゼロ・コラプス同士の比較で active_words == 0 を通るケース)
+                mpz_set_ui(gmp_a, 0);
+                mpz_set_ui(gmp_b, 0);
+                break;
+
+            case 4: // 【戦略4】片方だけが完全なる 0 (active_words 不一致、または符号とゼロの境界検証)
+                if (eng() % 2 == 0) {
+                    mpz_set_ui(gmp_a, 0);
+                    mpz_urandomb(gmp_b, gmp_state, bits_b);
+                    if (mpz_sgn(gmp_b) == 0) mpz_set_ui(gmp_b, 1ULL);
+                } else {
+                    mpz_urandomb(gmp_a, gmp_state, bits_a);
+                    if (mpz_sgn(gmp_a) == 0) mpz_set_ui(gmp_a, 1ULL);
+                    mpz_set_ui(gmp_b, 0);
+                }
+                break;
+
+            case 5: // 【戦略5】同一値から微小ノイズで末尾のワードだけを狂わせる (memcmp が途中で弾くケース)
+                mpz_urandomb(gmp_a, gmp_state, bits_a);
+                if (sign_dist(eng)) mpz_neg(gmp_a, gmp_a);
+                mpz_set(gmp_b, gmp_a);
+                if (eng() % 2 == 0) {
+                    mpz_add_ui(gmp_b, gmp_b, 1ULL);
+                } else {
+                    mpz_sub_ui(gmp_b, gmp_b, 1ULL);
+                }
+                break;
+        }
+
+        // PFI2 にデータを充填
+        [[maybe_unused]] bool ok_a = pfi_a.from_mpz(gmp_a);
+        [[maybe_unused]] bool ok_b = pfi_b.from_mpz(gmp_b);
+        assert(ok_a && ok_b);
+
+        // オラクル予測: GMP が 0 を返せば等値（true）、それ以外は不等（false）
+        bool expect_equal = (mpz_cmp(gmp_a, gmp_b) == 0);
+
+        // ターゲット演算実行
+        bool actual_equal_1 = (pfi_a == pfi_b);
+        bool actual_equal_2 = (pfi_b == pfi_a); // 対称性の検証
+
+        // 1. 一致性検証
+        if (actual_equal_1 != expect_equal) {
+            std::cerr << "CRITICAL FAILURE: operator== returned " << (actual_equal_1 ? "true" : "false")
+                      << ", but expected " << (expect_equal ? "true" : "false") << " at iteration " << i << std::endl;
+            gmp_printf("   gmp_a = %Zd\n", gmp_a);
+            gmp_printf("   gmp_b = %Zd\n", gmp_b);
+            std::exit(1);
+        }
+
+        // 2. 対称性の検証 (A == B ならば B == A であること)
+        if (actual_equal_1 != actual_equal_2) {
+            std::cerr << "CRITICAL FAILURE: operator== symmetry broken at iteration " << i << std::endl;
+            gmp_printf("   gmp_a = %Zd\n", gmp_a);
+            gmp_printf("   gmp_b = %Zd\n", gmp_b);
+            std::exit(1);
+        }
+
+        // 3. 同一インスタンス比較の自己等価性検証 (this == &rhs ルートの直接通過)
+        if (!(pfi_a == pfi_a) || !(pfi_b == pfi_b)) {
+            std::cerr << "CRITICAL FAILURE: operator== self-equality failed at iteration " << i << std::endl;
+            std::exit(1);
+        }
+    }
+
+    mpz_clear(gmp_a);
+    mpz_clear(gmp_b);
+    gmp_randclear(gmp_state);
+
+    std::cout << "-> Passed GMP Differential operator== Test successfully!" << std::endl;
+}
+
+// --- 2026年6月28日15時40分 ---
+
+void run_add_sub_identity_test(std::size_t iterations) {
+    std::cout
+        << "Running: Add/Sub Identity Test ("
+        << iterations
+        << " iterations)..."
+        << std::endl;
+
+    std::random_device rd;
+    uint64_t seed = rd();
+    std::mt19937_64 eng(seed);
+
+    std::cout
+        << "   [Identity Seed]: 0x"
+        << std::hex << seed
+        << std::dec
+        << std::endl;
+
+    gmp_randstate_t gmp_state;
+    gmp_randinit_default(gmp_state);
+    gmp_randseed_ui(gmp_state, seed);
+
+    constexpr std::size_t TEST_WORDS = 300;
+
+    const unsigned long MAX_BITS =
+        static_cast<unsigned long>(
+            TEST_WORDS *
+            PFI2::DIGITS_PER_WORD *
+            std::log2(PFI2::BASE) * 0.8
+        );
+
+    std::uniform_int_distribution<unsigned long>
+        bit_dist(0, MAX_BITS);
+
+    mpz_t gmp_a;
+    mpz_t gmp_b;
+
+    mpz_init(gmp_a);
+    mpz_init(gmp_b);
+
+    for (std::size_t i = 0; i < iterations; ++i) {
+
+        mpz_urandomb(gmp_a, gmp_state, bit_dist(eng));
+        mpz_urandomb(gmp_b, gmp_state, bit_dist(eng));
+
+        // ランダム符号
+        if (eng() & 1) mpz_neg(gmp_a, gmp_a);
+        if (eng() & 1) mpz_neg(gmp_b, gmp_b);
+
+        PFI2 a(TEST_WORDS * 3);
+        PFI2 b(TEST_WORDS * 3);
+
+        assert(a.from_mpz(gmp_a));
+        assert(b.from_mpz(gmp_b));
+
+        //--------------------------------------------------
+        // (a+b)-b == a
+        //--------------------------------------------------
+
+        PFI2 lhs1(TEST_WORDS * 3);
+        assert(lhs1.assign_contents(a));
+
+        bool ok1 = lhs1.add_inplace(b);
+
+        if (!ok1) {
+            std::cerr
+                << "add_inplace failed in identity test"
+                << std::endl;
+            std::exit(1);
+        }
+
+        bool ok2 = lhs1.sub_inplace(b);
+
+        if (!ok2) {
+            std::cerr
+                << "sub_inplace failed in identity test"
+                << std::endl;
+            std::exit(1);
+        }
+
+        if (!(lhs1 == a)) {
+            std::cerr
+                << "(a+b)-b != a"
+                << std::endl;
+
+            std::exit(1);
+        }
+
+        //--------------------------------------------------
+        // (a-b)+b == a
+        //--------------------------------------------------
+
+        PFI2 lhs2(TEST_WORDS * 3);
+        assert(lhs2.assign_contents(a));
+
+        bool ok3 = lhs2.sub_inplace(b);
+
+        if (!ok3) {
+            std::cerr
+                << "sub_inplace failed in identity test"
+                << std::endl;
+            std::exit(1);
+        }
+
+        bool ok4 = lhs2.add_inplace(b);
+
+        if (!ok4) {
+            std::cerr
+                << "add_inplace failed in identity test"
+                << std::endl;
+            std::exit(1);
+        }
+
+        if (!(lhs2 == a)) {
+            std::cerr
+                << "(a-b)+b != a"
+                << std::endl;
+
+            std::exit(1);
+        }
+
+        //--------------------------------------------------
+        // a + 0 = a
+        //--------------------------------------------------
+
+        {
+            PFI2 x(TEST_WORDS * 3);
+            PFI2 zero(TEST_WORDS * 3);
+
+            assert(x.assign_contents(a));
+
+            bool ok = x.add_inplace(zero);
+
+            if (!ok) {
+                std::cerr
+                    << "a + 0 failed"
+                    << std::endl;
+                std::exit(1);
+            }
+
+            if (!(x == a)) {
+                std::cerr
+                    << "a + 0 != a"
+                    << std::endl;
+                std::exit(1);
+            }
+        }
+
+        //--------------------------------------------------
+        // a - 0 = a
+        //--------------------------------------------------
+
+        {
+            PFI2 x(TEST_WORDS * 3);
+            PFI2 zero(TEST_WORDS * 3);
+
+            assert(x.assign_contents(a));
+
+            bool ok = x.sub_inplace(zero);
+
+            if (!ok) {
+                std::cerr
+                    << "a - 0 failed"
+                    << std::endl;
+                std::exit(1);
+            }
+
+            if (!(x == a)) {
+                std::cerr
+                    << "a - 0 != a"
+                    << std::endl;
+                std::exit(1);
+            }
+        }
+
+        //--------------------------------------------------
+        // a - a = 0
+        //--------------------------------------------------
+
+        {
+            PFI2 x(TEST_WORDS * 3);
+
+            assert(x.assign_contents(a));
+
+            bool ok = x.sub_inplace(a);
+
+            if (!ok) {
+                std::cerr
+                    << "a - a failed"
+                    << std::endl;
+                std::exit(1);
+            }
+
+            if (!x.is_zero()) {
+                std::cerr
+                    << "a - a != 0"
+                    << std::endl;
+                std::exit(1);
+            }
+        }
+
+        //--------------------------------------------------
+        // a + b = b + a
+        //--------------------------------------------------
+
+        {
+            PFI2 lhs(TEST_WORDS * 3);
+            PFI2 rhs(TEST_WORDS * 3);
+
+            assert(lhs.assign_contents(a));
+            assert(rhs.assign_contents(b));
+
+            bool ok1 = lhs.add_inplace(b);
+            bool ok2 = rhs.add_inplace(a);
+
+            if (!ok1 || !ok2) {
+                std::cerr
+                    << "commutativity add failed"
+                    << std::endl;
+                std::exit(1);
+            }
+
+            if (!(lhs == rhs)) {
+                std::cerr
+                    << "a + b != b + a"
+                    << std::endl;
+                std::exit(1);
+            }
+        }
+        //--------------------------------------------------
+        // invariant
+        //--------------------------------------------------
+
+        if (!lhs1.invariant_holds()) {
+            std::cerr
+                << "Invariant failure lhs1"
+                << std::endl;
+            std::exit(1);
+        }
+
+        if (!lhs2.invariant_holds()) {
+            std::cerr
+                << "Invariant failure lhs2"
+                << std::endl;
+            std::exit(1);
+        }
+    }
+
+    mpz_clear(gmp_a);
+    mpz_clear(gmp_b);
+
+    gmp_randclear(gmp_state);
+
+    std::cout
+        << "-> Passed Add/Sub Identity Test!"
+        << std::endl;
+}
+
+// --- 2026年6月28日15時54分 ---
+
 
 
 int main() {
@@ -852,8 +1979,17 @@ int main() {
         
         run_random_fuzz_test(100000);
         run_cmp_abs_fuzz_test(100000);
-        run_gmp_differential_add_test(40000);
-        run_gmp_differential_sub_test(40000);
+        //run_gmp_differential_add_test(40000);
+        //run_gmp_differential_sub_test(40000);
+        //run_gmp_differential_sub_from_test(40000);
+
+        //run_self_alias_test(40000);
+
+        //run_gmp_differential_add_inplace_test(40000);
+        //run_gmp_differential_sub_inplace_test(40000);
+        //run_gmp_differential_equal_test(40000);
+
+        run_add_sub_identity_test(50000);
 
         std::cout << "\nALL TESTS PASSED SUCCESSFULLY!" << std::endl;
     } catch (...) {

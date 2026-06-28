@@ -220,7 +220,10 @@ PFI2& PFI2::operator=(PFI2&& other) noexcept {
     return *this;
 }
 
-void PFI2::copy_from(const PFI2& other) {
+// オブジェクト複製
+// 容量変更あり
+// 再確保あり
+void PFI2::clone_from(const PFI2& other) {
     if (this == &other) return;
 
     // キャパシティが合わない場合は割り当て（再現性の確保のためベンチマークでは同サイズ前提）
@@ -241,6 +244,44 @@ void PFI2::copy_from(const PFI2& other) {
     if (this->words_ && other.words_ && this->active_words_ > 0) {
         std::memcpy(this->words_, other.words_, sizeof(uint64_t) * this->active_words_);
     }
+}
+
+// rhs の内容を this にコピーする。
+// capacity_words_ は変更しない。
+// capacity_words_ < rhs.active_words_ の場合は false。
+bool PFI2::assign_contents(const PFI2& rhs) noexcept {
+    if (this == &rhs) return true;
+
+    if (this->capacity_words_ < rhs.active_words_) return false;
+
+    std::memcpy(
+        this->words_,
+        rhs.words_,
+        sizeof(uint64_t)*rhs.active_words_
+    );
+
+    this->active_words_ = rhs.active_words_;
+    this->is_negative_  = rhs.is_negative_;
+
+    return true;
+}
+// rhs の内容を this にコピーする。
+// capacity_words_ と is_negative_ は変更しない。
+// capacity_words_ < rhs.active_words_ の場合は false。
+bool PFI2::assign_abs_contents(const PFI2& rhs) noexcept {
+    if (this == &rhs) return true;
+
+    if (this->capacity_words_ < rhs.active_words_) return false;
+
+    std::memcpy(
+        this->words_,
+        rhs.words_,
+        sizeof(uint64_t) * rhs.active_words_
+    );
+
+    this->active_words_ = rhs.active_words_;
+
+    return true;
 }
 
 // ==========================================
@@ -383,6 +424,30 @@ int PFI2::cmp(const PFI2& rhs) const noexcept {
     return is_negative_ ? -res_abs : res_abs;
 }
 
+bool PFI2::operator==(const PFI2& rhs) const noexcept {
+    if (this == &rhs) {
+        return true;
+    }
+
+    if (active_words_ != rhs.active_words_) {
+        return false;
+    }
+
+    if (is_negative_ != rhs.is_negative_) {
+        return false;
+    }
+
+    if (active_words_ == 0) {
+        return true;
+    }
+
+    return std::memcmp(
+        words_,
+        rhs.words_,
+        active_words_ * sizeof(uint64_t)
+    ) == 0;
+}
+
 void PFI2::neg() noexcept {
     // 値が 0 の場合は、符号を反転させると不変条件（0は必ず正）を破るため、
     // 何もせずに正常終了（true）とする。
@@ -392,7 +457,7 @@ void PFI2::neg() noexcept {
     }
 
     // 非ゼロのときのみ符号ビットを反転
-    this->is_negative_ = !this->is_negative_;
+    is_negative_ = !is_negative_;
 
     // 安全弁アサート
     //assert(this->invariant_holds());
@@ -404,6 +469,8 @@ void PFI2::neg() noexcept {
 // 符号は変更しない
 // 条件:
 //   結果のワード数 <= capacity(this)
+// 条件違反時は false を返す。
+// this の内容は保持されない。
 bool PFI2::add_abs_inplace(const PFI2& rhs) noexcept {
     // 相手が値として 0 なら、何も加算する必要がないので O(1) で即座に終了
     if (rhs.is_zero()) return true;
@@ -580,6 +647,8 @@ bool PFI2::add_abs_inplace(const PFI2& rhs) noexcept {
 // 符号は変更しない
 // 条件:
 //   |this| >= |rhs|
+// 条件違反時は false を返す。
+// this の内容は保持されない。
 bool PFI2::sub_abs_inplace(const PFI2& rhs) noexcept {
     if (rhs.is_zero()) return true;
 
@@ -677,7 +746,8 @@ bool PFI2::sub_abs_inplace(const PFI2& rhs) noexcept {
 
     // ボローが 0 に収束した場合、それより上の残りの自分のワードは変更不要。
     if (borrow == 0) {
-        w = std::max(w, lhs_active);
+        //w = std::max(w, lhs_active);
+        w = lhs_active;
     } else {
         // 最終的に borrow が残ってしまった場合は、前提条件（|this| >= |rhs|）に
         // 違反していた（アンダーフローした）ことを意味するので false を返す
@@ -702,18 +772,19 @@ bool PFI2::sub_abs_inplace(const PFI2& rhs) noexcept {
 // 条件:
 //   |rhs| >= |this|
 //   active_words(rhs) <= capacity(this)
+// 条件違反時は false を返す。
+// this の内容は保持されない。
 bool PFI2::sub_abs_from_inplace(const PFI2& rhs) noexcept {
     if (this->is_zero()) {
-        this->copy_from(rhs); // O(N) のワード一方向転送（内部で active_words_ も同期される想定）
-        return true;
+        return this->assign_abs_contents(rhs);
     }
 
-    if (this->capacity_words_ < rhs.active_words_) {
+    std::size_t rhs_active = rhs.active_words_;
+    if (this->capacity_words_ < rhs_active || this->active_words_ > rhs.active_words_) {
         return false;
     }
 
     std::size_t lhs_active = active_words_;
-    std::size_t rhs_active = rhs.active_words_;
 
     uint64_t borrow = 0;
     std::size_t w = 0;
@@ -723,21 +794,110 @@ bool PFI2::sub_abs_from_inplace(const PFI2& rhs) noexcept {
     constexpr uint64_t OFFSET_WORD = BASE | (BASE << PART_BITS) | (BASE << PART_BITS_TIMES_TWO);
     constexpr uint64_t FULL_DIGIT = BASE - 1;
 
+    uint64_t* const __restrict l_words = words_;
+    const uint64_t* const __restrict r_words = rhs.words_;
+
+    // 共通区間の一括減算
     for (; w < min_active; ++w) {
         
-        uint64_t diff_word = l_words[w] + OFFSET_WORD - r_words[w] - borrow;
+        uint64_t diff_word = r_words[w] + OFFSET_WORD - l_words[w] - borrow;
+
+        uint64_t d0 = diff_word & PART_MASK;
+        uint64_t d1 = (diff_word >> PART_BITS) & PART_MASK;
+        uint64_t d2 = (diff_word >> PART_BITS_TIMES_TWO) & PART_MASK;
+
+        if (d0 >= BASE) { d0 -= BASE; } else { d1 -= 1; }
+        if (d1 >= BASE) { d1 -= BASE; } else { d2 -= 1; }
+        if (d2 >= BASE) { d2 -= BASE; borrow = 0; } else { borrow = 1; }
+
+        l_words[w] = pack_word(d0, d1, d2);
     }
-    
+
+    // 自身のボロー残存区間の伝播
+    if (borrow != 0) {
+        // borrowが残っていて、this.active_words_までは筆算をしている -> thisはもうこれで終わり
+        while (w < rhs_active && r_words[w] == 0ULL) {
+            l_words[w] = SKIP_SIGNAL_WORD;
+            ++w;
+        }
+
+        // r_wordsが0でなければ、borrowは1なのだからどこかで借りを返せる
+        if (w < rhs_active) {
+            uint64_t d0, d1, d2;
+            unpack_word(r_words[w], d0, d1, d2);
+
+            do {
+                // 第0桁で借りが返せれば、d1 や d2 の計算命令を一切触らずに即break
+                if (d0 >= borrow) {
+                    d0 -= borrow;
+                    borrow = 0;
+                    break;
+                } else {
+                    d0 = FULL_DIGIT;
+                    borrow = 1;
+                }
+
+                // 第1桁
+                if (d1 >= borrow) {
+                    d1 -= borrow;
+                    borrow = 0;
+                    break;
+                } else {
+                    d1 = FULL_DIGIT;
+                    borrow = 1;
+                }
+
+                // 第2桁
+                if (d2 >= borrow) {
+                    d2 -= borrow;
+                    borrow = 0;
+                } else {
+                    d2 = FULL_DIGIT;    // 借りが上に溢れない限り実行されない
+                    borrow = 1;
+                }
+            } while (false);
+            
+            l_words[w] = pack_word(d0, d1, d2);
+            ++w;
+        }
+    }
+
+    // borrowが0にならなかった場合、|rhs|>=|this|に違反していたということ
+    // -> |rhs| < |this|
+    if (borrow != 0) {
+        return false;
+    }
+
+    // rhsの残りの部分をコピー
+    for (; w < rhs_active; ++w) {
+        l_words[w] = r_words[w];
+    }
+
+    // 厳密な active_words_ の更新
+    w = rhs_active;
+    while (w > 0 && l_words[w - 1] == 0ULL) {
+        --w;
+    }
+
+    active_words_ = w;
+    return true;
 }
 
+// this ← this + rhs
+// 符号付き加算。
+// 結果が this の capacity_words_ に収まる場合のみ成功する。
+// 戻り値:
+//   true  : 成功
+//   false : 容量不足などにより失敗
+//
+// 失敗時の this の内容は保証しない。
 bool PFI2::add_inplace(const PFI2& rhs) noexcept {
     // どちらかが 0 の場合は、O(1) で即時脱出（確実に成功）
     if (rhs.is_zero()) {
         return true;
     }
     if (this->is_zero()) {
-        this->copy_from(rhs);
-        return true;
+        return this->assign_contents(rhs);
     }
 
     if (this->is_negative_ == rhs.is_negative_) {
@@ -748,38 +908,90 @@ bool PFI2::add_inplace(const PFI2& rhs) noexcept {
         //  |this| + |rhs| = sign(this)(|this|+|rhs|)   thisが正
         // -|this| - |rhs| = sign(this)(|this|+|rhs|)   thisが負
         return this->add_abs_inplace(rhs);
-    } else {
-        // ---------------------------------------------------------
-        // トポロジー2: 異符号 (正 + 負、または 負 + 正)
-        // ---------------------------------------------------------
-        // 事前に絶対値の大小関係をスカウティング
-        int cmp = this->cmp_abs(rhs);
-
-        if (cmp > 0) {
-            // ケース 2-a: |this|(正) > |rhs|(負)
-            // 確実に引ききれることが保証されているので、カーネルを安全に叩く
-            // this + rhs = |this| - |rhs| > 0
-            return this->sub_abs_inplace(rhs);
-        } 
-        else if (cmp == 0) {
-            // ケース 2-b: |this| == |rhs|
-            // 絶対値が同じで異符号なので、結果は完全に 0
-            this->clear(); // active_words_ = 0, is_negative_ = false
-            return true;
-        } 
-        else {
-            // ---------------------------------------------------------
-            // ケース 2-c: |this|(負) < |rhs|(正) (主客転転)
-            // ---------------------------------------------------------
-            // この関数（add_inplace）のキャパシティやコピー禁止制約では
-            // this を汚染せずにインプレースで結果を保持することができない。
-            // 変な補正をここでベタ書きせず、仕様通り「普通に false で返す」
-            // this + rhs = -|this| + |rhs| = |rhs| - |this| < 0
-            // -( |this| - |rhs| )
-            // それとも...?
-            [[maybe_unused]] bool ok = this->sub_abs_inplace(rhs);
-            this->neg();
-            return ok;
-        }
     }
+    
+    // ---------------------------------------------------------
+    // トポロジー2: 異符号 (正 + 負、または 負 + 正)
+    // ---------------------------------------------------------
+    // 事前に絶対値の大小関係をスカウティング
+    int cmp = this->cmp_abs(rhs);
+
+    if (cmp > 0) {
+        // ケース 2-a: |this|(正) > |rhs|(負)
+        // 確実に引ききれることが保証されているので、カーネルを安全に叩く
+        // this + rhs = |this| - |rhs| > 0
+        return this->sub_abs_inplace(rhs);
+    }
+
+    if (cmp == 0) {
+        // ケース 2-b: |this| == |rhs|
+        // 絶対値が同じで異符号なので、結果は完全に 0
+        this->clear(); // active_words_ = 0, is_negative_ = false
+        return true;
+    }
+
+    // ---------------------------------------------------------
+    // ケース 2-c: |this|(負) < |rhs|(正) (主客転転)
+    // ---------------------------------------------------------
+    // この関数（add_inplace）のキャパシティやコピー禁止制約では
+    // this を汚染せずにインプレースで結果を保持することができない。
+    // 変な補正をここでベタ書きせず、仕様通り「普通に false で返す」
+    // this + rhs = -|this| + |rhs| = |rhs| - |this| < 0
+    bool ok = this->sub_abs_from_inplace(rhs);
+
+    if (ok) {
+        this->is_negative_ = rhs.is_negative_;
+    }
+
+    return ok;
+
+}
+
+bool PFI2::sub_inplace(const PFI2& rhs) noexcept {
+    if (rhs.is_zero()) return true;
+
+    if (this->is_zero()) {
+        bool ok = this->assign_abs_contents(rhs);
+
+        if (ok && !this->is_zero()) {
+            this->is_negative_ = !rhs.is_negative_;
+        }
+
+        return ok;
+    }
+
+    // 異符号
+    if (this->is_negative_ != rhs.is_negative_) {
+        //  |this(正)| + |rhs(負)|
+        // -|this(負)| - |rhs(正)| = sign(this)(|this| + |rhs|)
+        return this->add_abs_inplace(rhs);
+    }
+
+    // 同符号
+    int cmp = this->cmp_abs(rhs);
+
+    if (cmp > 0) {
+        // |this| > |rhs|
+        //  |this(正)| - |rhs(正)| > 0
+        // -|this(負)| + |rhs(負)| = sign(this)(|this| - |rhs|) < 9
+        return this->sub_abs_inplace(rhs);
+    }
+
+    if (cmp == 0) {
+        // |rhs| == |this|
+        // this - rhs = 0
+        this->clear();
+        return true;
+    }
+
+    // |this| < |rhs|
+    //  |this(正)| - |rhs(正)| = -sign(this)(|rhs| - |this|)
+    // -|this(負)| + |rhs(負)| = -sign(this)(|rhs| - |this|)
+    bool ok = this->sub_abs_from_inplace(rhs);
+
+    if (ok) {
+        this->is_negative_ = !this->is_negative_;
+    }
+
+    return ok;
 }
